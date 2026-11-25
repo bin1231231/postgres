@@ -69,7 +69,7 @@ SELECT * FROM pg_hsm_extents();  -- 区表：每个区一行
 | `hsm_device` | `''`（关闭） | 块设备（或普通文件）路径，修改后需重启 |
 | `hsm_max_files` | 4096 | 格式化新设备时文件表的槽位数（fork 数上限） |
 
-## 在 MacBook 上运行
+## 在 macOS 上运行
 
 macOS 没有 loop 设备，用 Docker Desktop（或 OrbStack）运行 Linux 容器：
 
