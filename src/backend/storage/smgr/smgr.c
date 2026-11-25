@@ -20,6 +20,7 @@
 #include "access/xlogutils.h"
 #include "lib/ilist.h"
 #include "storage/bufmgr.h"
+#include "storage/hsm.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
@@ -82,8 +83,29 @@ static const f_smgr smgrsw[] = {
 		.smgr_nblocks = mdnblocks,
 		.smgr_truncate = mdtruncate,
 		.smgr_immedsync = mdimmedsync,
+	},
+	/* HSM: relation data stored directly on a block device, see hsm.c */
+	{
+		.smgr_init = hsm_init,
+		.smgr_shutdown = hsm_shutdown,
+		.smgr_open = hsm_open,
+		.smgr_close = hsm_close,
+		.smgr_create = hsm_create,
+		.smgr_exists = hsm_exists,
+		.smgr_unlink = hsm_unlink,
+		.smgr_extend = hsm_extend,
+		.smgr_prefetch = hsm_prefetch,
+		.smgr_read = hsm_read,
+		.smgr_write = hsm_write,
+		.smgr_writeback = hsm_writeback,
+		.smgr_nblocks = hsm_nblocks,
+		.smgr_truncate = hsm_truncate,
+		.smgr_immedsync = hsm_immedsync,
 	}
 };
+
+StaticAssertDecl(lengthof(smgrsw) == HSM_SMGR_ID + 1,
+				 "HSM_SMGR_ID must be the index of HSM in smgrsw[]");
 
 static const int NSmgr = lengthof(smgrsw);
 
@@ -176,7 +198,8 @@ smgropen(RelFileNode rnode, BackendId backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		for (int i = 0; i <= MAX_FORKNUM; ++i)
 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
-		reln->smgr_which = 0;	/* we only have md.c at present */
+		/* md.c (0) or hsm.c (HSM_SMGR_ID), decided once per relation */
+		reln->smgr_which = hsm_choose_smgr(brnode);
 
 		/* implementation-specific initialization */
 		smgrsw[reln->smgr_which].smgr_open(reln);

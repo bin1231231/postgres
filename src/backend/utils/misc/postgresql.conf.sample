@@ -160,6 +160,12 @@
 
 #temp_file_limit = -1			# limits per-process temp file space
 					# in kilobytes, or -1 for no limit
+#hsm_device = ''			# block device (or file) for the HSM storage
+					# manager; '' disables it
+					# (change requires restart)
+#hsm_max_files = 4096			# relation fork slots when formatting a new
+					# HSM device
+					# (change requires restart)
 
 # - Kernel Resources -
 

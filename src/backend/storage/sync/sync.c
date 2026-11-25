@@ -29,6 +29,7 @@
 #include "portability/instr_time.h"
 #include "postmaster/bgwriter.h"
 #include "storage/bufmgr.h"
+#include "storage/hsm.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -121,6 +122,12 @@ static const SyncOps syncsw[] = {
 	/* pg_multixact/members */
 	[SYNC_HANDLER_MULTIXACT_MEMBER] = {
 		.sync_syncfiletag = multixactmemberssyncfiletag
+	},
+	/* HSM block device */
+	[SYNC_HANDLER_HSM] = {
+		.sync_syncfiletag = hsm_syncfiletag,
+		.sync_unlinkfiletag = hsm_unlinkfiletag,
+		.sync_filetagmatches = hsm_filetagmatches
 	}
 };
 

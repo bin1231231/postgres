@@ -1,0 +1,182 @@
+src/backend/storage/smgr/README.hsm
+
+HSM：块设备存储引擎设计说明
+==========================
+
+1. 目标
+-------
+
+PostgreSQL 通过 smgr.c 里的函数表 smgrsw[] 访问存储，目前只有一个实现 md.c：
+每个关系 fork 存成文件系统里的一个或多个 1GB 段文件，空间管理完全交给文件系统。
+
+HSM（参照课上的 Halo Storage Manager）是 smgrsw[] 中的第二个存储引擎
+（下标 HSM_SMGR_ID = 1）。它绕过文件系统，直接在一块裸块设备（例如
+losetup 得到的 /dev/loop0）上存放关系数据，自己完成空间的分配、回收和元数据检索。
+
+    SQL → 执行器 → bufmgr.c (Shared Buffer)
+                      │ smgrread / smgrwrite / smgrextend ...
+                      ▼
+                   smgr.c   smgrsw[reln->smgr_which]
+                  ┌───┴──────────────┐
+                md.c (0)          hsm.c (1)
+             文件系统中的文件      块设备 /dev/loop0
+
+f_smgr 的全部 15 个接口都已实现（作业要求的 init / open / create / read /
+write / close 之外，exists、extend、nblocks、truncate、unlink 等也必须实现，
+否则连 CREATE TABLE 都无法完成）。
+
+
+2. 设备布局
+-----------
+
+块大小与数据库页相同（BLCKSZ = 8KB）：
+
+    块 0                超级块 HsmSuperBlock：魔数 "HSM1"、版本、块大小、
+                        设备块数、文件表位置与大小、数据区位置、CRC
+    块 1 .. N           文件表：每个关系 fork 占一条 512 字节的记录
+    块 data_start ..    数据区：按 64KB 的“分配单元”管理
+
+文件表记录 HsmDiskRecord（恰好 512 字节 = 一个扇区）：
+
+    magic | flags | forknum | RelFileNode(spc,db,rel) | nblocks | nextents | crc
+    extents[60] = { 设备起始块, 块数 }
+
+它相当于文件系统的 inode/文件分配表，也对应 PPT 中的
+(FILE_ID, Extent_ID, Extent_Size, 偏移) 区表。可以用 SQL 直接查看：
+
+    SELECT * FROM pg_hsm_files();      -- 文件表：每个 fork 一行
+    SELECT * FROM pg_hsm_extents();    -- 区表：每个区一行
+    SELECT * FROM pg_hsm_status();     -- 设备、空间与 I/O 统计
+
+设计要点：
+
+* 一条记录恰好是一个扇区，更新是原子的，不会写坏相邻记录；每条记录带 CRC。
+* 空闲空间位图不落盘，启动时由文件表重建，避免“两份元数据互相矛盾”。
+  重建时会检查“同一个分配单元被两个区占用”等不一致，发现就拒绝启动。
+* 新设备（第 0 块全零）在第一次启动时自动格式化；第 0 块不是 HSM 超级块的
+  设备一律拒绝使用，不会误格式化别人的数据。
+* 文件表最多占设备的 1/8，所以 PPT 中 1MB 的示例设备（dd count=128）也能用。
+
+
+3. 空间分配：区（extent）
+-------------------------
+
+* 以“区”为分配的基本单位，以“块”为使用的基本单位（PPT：存储引擎设计）。
+* 区的大小随 fork 增长：前 8 个区 64KB，然后 512KB、4MB、32MB，最后 64MB。
+  文件越大、区越大，因此大表的元数据依然很小；60 个区约可容纳 1.6GB。
+* 每个区由若干个连续的 64KB 分配单元组成，同一个区在物理上连续。分配用
+  next-fit 在位图中查找连续空闲单元，找不到所需大小时减半重试，直到 1 个单元。
+* 块号映射：区在 HsmFile 中按逻辑起始块号有序存放，
+  逻辑块号 → 设备块号 用一次二分查找完成。
+
+
+4. 内存中的元数据检索
+---------------------
+
+* 共享内存哈希表：(RelFileNode, ForkNumber) → HsmFile
+  （fork 的长度、已分配容量、区列表），相当于 PPT 中“HASH 作为 1 级缓存”。
+  postmaster 启动时从文件表一次性加载，所有后端共享。
+* 两把 LWLock：
+    HsmLock      保护哈希表、位图和计数器。读写数据块只需共享锁查映射，
+                 真正的 pread/pwrite 在锁外进行；
+    HsmSyncLock  串行化“fsync 设备 + 回收空间”的流程。
+* 每个后端只打开一个设备 fd。md.c 需要的 MdfdVec、vfd、1GB 分段等机制
+  在 HSM 中都不需要，因此 hsm_open / hsm_close 是空操作。
+
+
+5. 各接口的实现
+---------------
+
+    smgr_init / shutdown   后端级初始化；退出时关闭设备 fd
+    smgr_open / close      无事可做（元数据在共享内存，所有关系共用一个 fd）
+    smgr_create            分配文件表槽位，写入一条空记录（长度 0、无区）
+    smgr_exists            查哈希表（与 md.c 一样，墓碑也算存在）
+    smgr_extend            按需分配新区；目标块之前的空洞写零（hash 索引依赖
+                           这一语义）；数据写完后才更新并持久化长度
+    smgr_read / write      查映射后 pread / pwrite；超出长度时与 mdread 一致
+                           （恢复期间或 zero_damaged_pages 时返回零页）
+    smgr_nblocks           返回记录中的逻辑长度
+    smgr_truncate          完全位于截断点之后的区立即摘除；不分配内存
+    smgr_unlink            main fork 留墓碑，其它 fork 立即删除（见 §6）
+    smgr_prefetch          posix_fadvise(WILLNEED)
+    smgr_writeback         sync_file_range（pg_flush_data）
+    smgr_immedsync         fsync 设备
+
+
+6. 崩溃一致性
+-------------
+
+HSM 沿用 PostgreSQL 的 WAL 体系，原则与 md.c 相同：checkpoint 之前的修改由
+checkpoint 持久化，checkpoint 之后的修改由 WAL 重放恢复。
+
+(1) fsync 交给 checkpointer。
+    sync.c 中新增同步处理器 SYNC_HANDLER_HSM。每次写数据都向 checkpointer
+    注册一个代表“整个设备”的同步请求，所有 fork 共用同一个 tag，checkpointer
+    会自动去重，所以每次 checkpoint 只 fsync 设备一次（md.c 是按段文件 fsync）。
+
+(2) 元数据先写页缓存，随设备一起持久化。
+    长度、区列表的变化立即写入页缓存（pwrite），在 checkpoint 时和数据一起
+    落盘。崩溃后若长度没有落盘，WAL 重放会重新扩展关系，这与 md.c 依赖
+    文件长度的情况完全一样。
+
+(3) 释放的空间延迟复用。
+    TRUNCATE/DROP/VACUUM 释放的区先进入 pending 状态，直到下一次设备 fsync
+    成功（保证“释放”这件事已落盘）后才归还空闲位图。否则可能出现：
+    释放记录还在页缓存里、空间已被别的表占用并落盘，崩溃后两个文件声称拥有
+    同一个区。空间不足时，分配器会先主动 fsync 一次以回收 pending 空间。
+    fsync = off 时没有持久化可言，释放的空间立即可用。
+
+(4) 墓碑，防止 relfilenode 被过早复用。
+    与 mdunlink() 的注释描述的问题相同：删除 main fork 后，若 relfilenode
+    在下一次 checkpoint 前被新表复用，而新表在 wal_level=minimal 下没有写 WAL，
+    崩溃后重放旧表的删除会删掉新表的数据。因此 main fork 被删除时：
+    空间立即释放，但保留一条长度为 0 的墓碑记录，并向 checkpointer 注册
+    SYNC_UNLINK_REQUEST；checkpoint 完成后 hsm_unlinkfiletag() 才删除墓碑。
+    catalog.c 的 GetNewRelFileNode() 同时检查 HSM，跳过仍被占用的 relfilenode。
+
+(5) 启动时的整体检查与落盘。
+    postmaster 加载文件表时校验 CRC、区范围和重叠；加载完成后 fsync 一次设备，
+    这样即使是后端崩溃后的重新初始化，之前写入页缓存的释放记录也已持久化。
+
+
+7. 哪些关系存放在 HSM 中（路由）
+--------------------------------
+
+smgropen() 中调用 hsm_choose_smgr() 决定一次，结果缓存在 SMgrRelation 中：
+
+* hsm_device 为空（默认）→ 全部由 md.c 负责，行为与原版完全相同；
+* 临时表、非默认表空间中的关系、relfilenode < 16384 的关系（initdb 创建的
+  系统表）→ md.c；
+* 已经在 HSM 中的 relfilenode → HSM；
+* 打开 HSM 之前就存在、有 md 文件的用户表 → 继续由 md.c 负责；
+* 其余（新建的用户表、索引、TOAST 表及其 FSM/VM fork）→ HSM。
+
+
+8. 与 PostgreSQL 其它部分的配合
+-------------------------------
+
+    smgr.c          smgrsw[] 注册 HSM；smgropen() 路由
+    sync.c/sync.h   SYNC_HANDLER_HSM：checkpoint fsync、延迟删除墓碑
+    ipci.c          共享内存大小与初始化
+    lwlocknames.txt HsmLock、HsmSyncLock
+    guc.c           hsm_device、hsm_max_files（需重启生效）
+    catalog.c       分配 relfilenode 时避开 HSM 中仍被占用的编号
+    dbcommands.c    DROP DATABASE（含重放与 CREATE DATABASE 失败清理）删除该库
+                    在 HSM 中的关系；拒绝会丢数据的 FILE_COPY 与
+                    ALTER DATABASE SET TABLESPACE
+    reinit.c        崩溃恢复时重置 HSM 中的 unlogged 表
+    dbsize.c        pg_relation_size()/pg_database_size()/pg_tablespace_size()
+                    计入 HSM 中的数据
+    pg_proc.dat     pg_hsm_status() / pg_hsm_files() / pg_hsm_extents()
+
+
+9. 已知限制
+-----------
+
+* 单个 fork 最多 60 个区（约 1.6GB）。
+* 文件表槽位数在格式化时确定（hsm_max_files），之后不能扩大。
+* 基于文件复制的工具看不到设备上的数据：pg_basebackup、物理流复制备库、
+  pg_upgrade、pg_rewind、pg_checksums 均不支持 HSM 中的关系。
+* 与 md.c 一样，崩溃时尚未提交的事务所创建的关系会遗留在设备上
+  （md.c 遗留的是孤儿文件）。
+* 设备的 fsync 会刷出整个设备的脏页；设备只应由一个 PostgreSQL 实例使用。

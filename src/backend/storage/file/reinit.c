@@ -20,6 +20,7 @@
 #include "postmaster/startup.h"
 #include "storage/copydir.h"
 #include "storage/fd.h"
+#include "storage/hsm.h"
 #include "storage/reinit.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -91,6 +92,9 @@ ResetUnloggedRelations(int op)
 	}
 
 	FreeDir(spc_dir);
+
+	/* Unlogged relations stored on the HSM device */
+	hsm_reset_unlogged_relations(op);
 
 	/*
 	 * Restore memory context.

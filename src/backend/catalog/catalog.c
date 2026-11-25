@@ -43,6 +43,7 @@
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/hsm.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
 #include "utils/rel.h"
@@ -624,6 +625,15 @@ GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence)
 		if (access(rpath, F_OK) == 0)
 		{
 			/* definite collision */
+			collides = true;
+		}
+		else if (hsm_relfilenode_in_use(rnode.node))
+		{
+			/*
+			 * The relfilenode is still known to the HSM storage manager
+			 * (possibly as a tombstone awaiting the next checkpoint), which
+			 * plays the same role as md.c's leftover empty file.
+			 */
 			collides = true;
 		}
 		else

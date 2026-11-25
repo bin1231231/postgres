@@ -57,6 +57,7 @@
 #include "replication/slot.h"
 #include "storage/copydir.h"
 #include "storage/fd.h"
+#include "storage/hsm.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "storage/md.h"
@@ -1021,6 +1022,17 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 					 errhint("Valid strategies are \"wal_log\" and \"file_copy\".")));
 	}
 
+	/*
+	 * FILE_COPY copies the template's directories, so it would miss the
+	 * template's relations that live on the HSM device.
+	 */
+	if (dbstrategy == CREATEDB_FILE_COPY && hsm_database_has_relations(src_dboid))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot use strategy \"file_copy\": template database \"%s\" has relations stored on the HSM device",
+						dbtemplate ? dbtemplate : "template1"),
+				 errhint("Use STRATEGY = WAL_LOG instead.")));
+
 	/* If encoding or locales are defaulted, use source's setting */
 	if (encoding < 0)
 		encoding = src_encoding;
@@ -1526,6 +1538,9 @@ createdb_failure_callback(int code, Datum arg)
 
 	/* Throw away any successfully copied subdirectories */
 	remove_dbtablespaces(fparms->dest_dboid);
+
+	/* ... and any relations already created on the HSM device */
+	hsm_drop_database(fparms->dest_dboid);
 }
 
 
@@ -1743,6 +1758,9 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 */
 	remove_dbtablespaces(db_id);
 
+	/* Remove the database's relations stored on the HSM device */
+	hsm_drop_database(db_id);
+
 	/*
 	 * Close pg_database, but keep lock till commit.
 	 */
@@ -1922,6 +1940,16 @@ movedb(const char *dbname, const char *tblspcname)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("cannot change the tablespace of the currently open database")));
+
+	/*
+	 * Moving copies the database directory; relations stored on the HSM
+	 * device are keyed by the default tablespace and would be lost.
+	 */
+	if (hsm_database_has_relations(db_id))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot change the tablespace of database \"%s\": it has relations stored on the HSM device",
+						dbname)));
 
 	/*
 	 * Get tablespace's oid
@@ -3304,6 +3332,9 @@ dbase_redo(XLogReaderState *record)
 								dst_path)));
 			pfree(dst_path);
 		}
+
+		/* And the database's relations stored on the HSM device */
+		hsm_drop_database(xlrec->db_id);
 
 		if (InHotStandby)
 		{

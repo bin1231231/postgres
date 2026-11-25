@@ -90,6 +90,7 @@
 #include "storage/bufmgr.h"
 #include "storage/dsm_impl.h"
 #include "storage/fd.h"
+#include "storage/hsm.h"
 #include "storage/large_object.h"
 #include "storage/pg_shmem.h"
 #include "storage/predicate.h"
@@ -2545,6 +2546,16 @@ static struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"hsm_max_files", PGC_POSTMASTER, RESOURCES_DISK,
+			gettext_noop("Sets the number of relation fork slots when formatting the HSM device."),
+			gettext_noop("Only used when a new (all-zero) HSM device is formatted.")
+		},
+		&hsm_max_files,
+		4096, 16, 1000000,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"temp_file_limit", PGC_SUSET, RESOURCES_DISK,
 			gettext_noop("Limits the total size of all temporary files used by each process."),
 			gettext_noop("-1 means no limit."),
@@ -4153,6 +4164,17 @@ static struct config_string ConfigureNamesString[] =
 		&default_tablespace,
 		"",
 		check_default_tablespace, NULL, NULL
+	},
+
+	{
+		{"hsm_device", PGC_POSTMASTER, RESOURCES_DISK,
+			gettext_noop("Sets the block device (or file) used by the HSM storage manager."),
+			gettext_noop("An empty string disables HSM; user relations are then stored in regular files by md.c."),
+			GUC_SUPERUSER_ONLY
+		},
+		&hsm_device,
+		"",
+		NULL, NULL, NULL
 	},
 
 	{

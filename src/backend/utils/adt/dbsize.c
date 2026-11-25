@@ -23,6 +23,7 @@
 #include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/hsm.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/numeric.h"
@@ -128,6 +129,9 @@ calculate_database_size(Oid dbOid)
 	/* Include pg_default storage */
 	snprintf(pathname, sizeof(pathname), "base/%u", dbOid);
 	totalsize = db_dir_size(pathname);
+
+	/* Include relations stored on the HSM device */
+	totalsize += hsm_database_size(dbOid);
 
 	/* Scan the non-default tablespaces */
 	snprintf(dirpath, MAXPGPATH, "pg_tblspc");
@@ -252,6 +256,10 @@ calculate_tablespace_size(Oid tblspcOid)
 
 	FreeDir(dirdesc);
 
+	/* HSM stores relations of the default tablespace on its device */
+	if (tblspcOid == DEFAULTTABLESPACE_OID)
+		totalsize += hsm_database_size(InvalidOid);
+
 	return totalsize;
 }
 
@@ -298,6 +306,16 @@ calculate_relation_size(RelFileNode *rfn, BackendId backend, ForkNumber forknum)
 	char	   *relationpath;
 	char		pathname[MAXPGPATH];
 	unsigned int segcount = 0;
+
+	/* Relations stored on the HSM device have no files to stat() */
+	if (backend == InvalidBackendId)
+	{
+		bool		found;
+		int64		hsmsize = hsm_relation_size(*rfn, forknum, &found);
+
+		if (found)
+			return hsmsize;
+	}
 
 	relationpath = relpathbackend(*rfn, backend, forknum);
 

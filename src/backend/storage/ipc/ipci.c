@@ -38,6 +38,7 @@
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
 #include "storage/dsm.h"
+#include "storage/hsm.h"
 #include "storage/ipc.h"
 #include "storage/pg_shmem.h"
 #include "storage/pmsignal.h"
@@ -141,6 +142,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, SyncScanShmemSize());
 	size = add_size(size, AsyncShmemSize());
 	size = add_size(size, StatsShmemSize());
+	size = add_size(size, HsmShmemSize());
 #ifdef EXEC_BACKEND
 	size = add_size(size, ShmemBackendArraySize());
 #endif
@@ -293,6 +295,7 @@ CreateSharedMemoryAndSemaphores(void)
 	SyncScanShmemInit();
 	AsyncShmemInit();
 	StatsShmemInit();
+	HsmShmemInit();
 
 #ifdef EXEC_BACKEND
 
